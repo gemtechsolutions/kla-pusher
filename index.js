@@ -1,7 +1,7 @@
 // Pusher/Laravel Echo listener service - Version 2
 // Connects using Pusher protocol to match Laravel Echo
 
-const Pusher = require('pusher-js/node');
+const { Pusher } = require('pusher-js');
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
