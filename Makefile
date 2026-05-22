@@ -1,82 +1,76 @@
-.PHONY: help install dev start stop restart logs clean test subscribe check
+YARN ?= yarn
+PORT ?= 3001
 
-help: ## Show this help message
-	@echo 'Usage: make [target]'
-	@echo ''
-	@echo 'Available targets:'
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+# Deploy targets — override on the command line:
+#   EC2_HOST=ec2-user@<eip> SSH_KEY=~/path/to/key.pem make deploy
+EC2_HOST ?= ec2-user@13.213.84.178
+SSH_KEY  ?= /home/user/Documents/projects/khmer-lotto/kla-devops/production/ec2/.keys/kla-pusher-production.pem
 
-install: ## Install dependencies
-	npm install
+.PHONY: help install dev build start typecheck clean health subscribe-info deploy logs status
 
-dev: ## Run in development mode with auto-reload
-	npm run dev
-
-run: ## Start the service
-	node index.js
-
-start-bg: ## Start the service in background with PM2
-	pm2 start index.js --name pusher-listener
-	pm2 save
-
-stop: ## Stop the background service
-	pm2 stop pusher-listener
-
-restart: ## Restart the background service
-	pm2 restart pusher-listener
-
-logs: ## View service logs (PM2)
-	pm2 logs pusher-listener
-
-status: ## Check service status
-	pm2 status pusher-listener
-
-clean: ## Clean node_modules and reinstall
-	rm -rf node_modules package-lock.json
-	npm install
-
-subscribe: ## Subscribe to current event (requires EVENT_ID)
-	@if [ -z "$(EVENT_ID)" ]; then \
-		echo "Usage: make subscribe EVENT_ID=69c3877f7f569"; \
-		exit 1; \
-	fi
-	curl -X POST http://localhost:3001/api/event/subscribe \
-		-H "Content-Type: application/json" \
-		-d '{"eventId": "$(EVENT_ID)"}'
-
-check: ## Check latest betting data
-	curl http://localhost:3001/api/betting-data/latest | jq
-
-current: ## Get current event info
-	curl http://localhost:3001/api/event/current | jq
-
-test-connection: ## Test WebSocket connection
-	@echo "Testing connection to http://localhost:3001..."
-	@curl -s http://localhost:3001/api/event/current > /dev/null && \
-		echo "✅ Service is running!" || \
-		echo "❌ Service is not responding"
-
-setup: install ## First-time setup
-	@echo "✅ Dependencies installed"
+help:
+	@echo "kla-pusher v2 - Makefile commands"
 	@echo ""
-	@echo "Next steps:"
-	@echo "  1. Update .env with your configuration"
-	@echo "  2. Run 'make start' to start the service"
-	@echo "  3. Run 'make subscribe EVENT_ID=<eventId>' to subscribe to events"
-	@echo "  4. Run 'make check' to see betting data"
+	@echo "Development:"
+	@echo "  make install     Install dependencies (yarn)"
+	@echo "  make dev         Run with tsx watch (TypeScript, hot reload)"
+	@echo "  make build       Compile TS to dist/"
+	@echo "  make start       Run the compiled service (after build)"
+	@echo "  make typecheck   tsc --noEmit"
+	@echo "  make clean       Remove node_modules and dist"
+	@echo ""
+	@echo "Operations:"
+	@echo "  make health      curl /_health"
+	@echo "  make subscribe-info  Show how the SSE endpoint is consumed"
+	@echo ""
+	@echo "Production (require EC2_HOST=ec2-user@<eip> SSH_KEY=...):"
+	@echo "  make deploy      Build + rsync to the EC2 + restart systemd"
+	@echo "  make logs        Tail kla-pusher logs (journalctl -f)"
+	@echo "  make status      Show systemd service status"
 
-# Production targets
-prod-install: ## Install PM2 globally for production
-	npm install -g pm2
+install:
+	$(YARN) install
 
-prod-start: ## Start in production mode with PM2
-	pm2 start index.js --name pusher-listener -i 1
-	pm2 save
-	pm2 startup
+dev:
+	$(YARN) dev
 
-prod-stop: ## Stop production service
-	pm2 stop pusher-listener
-	pm2 delete pusher-listener
+build:
+	$(YARN) build
 
-prod-logs: ## Tail production logs
-	pm2 logs pusher-listener --lines 100
+start:
+	$(YARN) start
+
+typecheck:
+	$(YARN) typecheck
+
+clean:
+	rm -rf node_modules dist
+
+health:
+	@curl -s http://localhost:$(PORT)/_health | python3 -m json.tool 2>/dev/null || curl -s http://localhost:$(PORT)/_health
+
+subscribe-info:
+	@echo "SSE endpoint: GET http://localhost:$(PORT)/sse?streamId=<id>"
+	@echo "List active streams: GET http://localhost:$(PORT)/api/streams"
+	@echo ""
+	@echo "Registry source: \$$REGISTRY_SOURCE (local | site-api)"
+	@echo "  local  → ./data/streams.json (array of StreamMeta)"
+	@echo "  site-api → GET \$$SITE_API_BASE_URL/api/private/internal/streams"
+
+# Deploy = build locally + rsync dist/ + (re)write systemd unit + restart.
+# Pulls EC2_HOST + SSH_KEY from the environment so the script can run
+# standalone too. `.env` on the remote is NOT touched; manage it via SSH.
+deploy:
+	@test -n "$(EC2_HOST)" || { echo "EC2_HOST required: EC2_HOST=ec2-user@<eip> SSH_KEY=path/to/key.pem make deploy"; exit 1; }
+	@test -n "$(SSH_KEY)"  || { echo "SSH_KEY required: EC2_HOST=ec2-user@<eip> SSH_KEY=path/to/key.pem make deploy"; exit 1; }
+	EC2_HOST="$(EC2_HOST)" SSH_KEY="$(SSH_KEY)" ./scripts/deploy.sh
+
+logs:
+	@test -n "$(EC2_HOST)" || { echo "EC2_HOST required"; exit 1; }
+	@test -n "$(SSH_KEY)"  || { echo "SSH_KEY required"; exit 1; }
+	ssh -i "$(SSH_KEY)" "$(EC2_HOST)" 'sudo journalctl -u kla-pusher -f'
+
+status:
+	@test -n "$(EC2_HOST)" || { echo "EC2_HOST required"; exit 1; }
+	@test -n "$(SSH_KEY)"  || { echo "SSH_KEY required"; exit 1; }
+	ssh -i "$(SSH_KEY)" "$(EC2_HOST)" 'sudo systemctl status kla-pusher --no-pager'
