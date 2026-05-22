@@ -1,4 +1,7 @@
 node_modules/
+dist/
 .env
 *.log
 .DS_Store
+data/**/*.json
+!data/streams.json

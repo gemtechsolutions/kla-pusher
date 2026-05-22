@@ -1,160 +1,135 @@
-# Pusher Betting Data Listener Service
+# kla-pusher (v2)
 
-This Node.js service connects to the sultadahan247.live Laravel Echo WebSocket server and streams real-time betting data to your frontend.
+Multi-stream betting-event fan-out. Subscribes to N upstream data sources via pluggable adapters, broadcasts a canonical event vocabulary over per-stream SSE rooms.
 
-## Quick Start
+See [`docs/stream-pipeline-redesign.md`](../kla-site-api/docs/stream-pipeline-redesign.md) for the wider design.
 
-```bash
-# First-time setup
-make setup
+## What changed from v1
 
-# Start the service
-make start
+| | v1 (legacy, removed) | v2 |
+|---|---|---|
+| Language | JS | TypeScript |
+| Layout | one `index.js` | `src/` modules (lib, adapters, routes) |
+| Subscriptions | one global `eventId` | one per `ACTIVE` stream in the registry |
+| SSE | one global stream | per-stream rooms keyed by `streamId` |
+| Event names | raw `App\\Events\\PlaceBet` | canonical `place-bet`, `declare-winner`, etc. |
+| Result persistence | local JSON only | local JSON + POST to site-api finalize endpoint |
+| Stream source | hardcoded env vars | pluggable Registry (local JSON file or site-api) |
 
-# Subscribe to an event
-make subscribe EVENT_ID=69c3877f7f569
+## Architecture
 
-# Check latest betting data
-make check
+```
+            ┌──────────────────────┐
+            │  Registry            │  ← local JSON file (dev) or site-api (prod)
+            └──────────┬───────────┘
+                       │ list() every 30s
+                       ▼
+        ┌─────────────────────────────┐
+        │  StreamManager              │  reconciles registry → adapters
+        │   Map<streamId, runtime>    │
+        └──┬──────────┬──────────┬────┘
+           │          │          │
+           ▼          ▼          ▼
+   Adapter A    Adapter B    Adapter C        ← one per active stream
+   (pusher-     (...)        (...)              each holds its own
+    laravel)                                    upstream connection
+        \         │          /
+         \        │         /        emit(canonical) + finalize()
+          ▼       ▼        ▼
+        ┌─────────────────────┐
+        │  SseRooms           │     fan-out to per-stream SSE clients
+        │  Map<streamId, Set> │
+        └─────────────────────┘
 ```
 
-For all available commands, run `make help`.
+Adapters never touch SSE, disk, or HTTP — only the `AdapterReport` callbacks the manager hands them.
 
-## Manual Setup
+## Canonical event vocabulary
 
-### Install Dependencies
-```bash
-npm install
+SSE clients always receive `{ type, streamId, data, ts, upstreamRef? }`:
+
+| Type | Source |
+|---|---|
+| `place-bet`, `betting-status`, `event-status`, `declare-winner`, `send-notification`, `jump-number`, `refresh-all`, `change-team` | Adapter, translated from upstream |
+| `game-ended` | Adapter derives from `declare-winner` |
+| `stream-stale` | Manager's `StreamHealth` after grace expires |
+| `stream-removed` | Manager when registry no longer includes the stream |
+
+## Endpoints
+
+```
+GET  /_health                          {status, streams, uptimeSec}
+GET  /sse?streamId=foo                 SSE room for one stream
+GET  /api/streams                      list active streams + client counts
+GET  /api/streams/:id/latest           latest payload per canonical type
+GET  /api/streams/:id/results          last N finalized results (?limit=N)
+GET  /api/streams/:id/health           per-stream stale/game-end summary
+GET  /api/adapters                     installed data adapter ids
 ```
 
-### Environment Variables
+None of v1's legacy endpoints (`/api/event/subscribe`, `/api/betting-data/stream`, `/api/betting-data/latest`, `/api/results`, `/api/stream/health`, `/api/test/winner`) are kept. The frontend `useBettingData` hook must be updated to call `/sse?streamId=...`.
 
-Create a `.env` file:
+## Configuration
 
-```env
+`.env`:
+
+```
 PORT=3001
-SOCKET_HOST=wss://ws.web-services.live:6001
-APP_KEY=shifenkey123
+REGISTRY_SOURCE=local              # "local" or "site-api"
+STREAMS_REGISTRY_FILE=./data/streams.json
+SITE_API_BASE_URL=http://localhost:4000
+SITE_API_SERVICE_TOKEN=
+REGISTRY_GAME_IDS=game-3
+REGISTRY_POLL_INTERVAL_MS=30000
 ```
 
-### Running Locally
+### Local registry shape
 
-```bash
-# Direct
-node index.js
-
-# Or using make
-make start
-
-# Or with auto-reload
-make dev
-```
-
-## API Endpoints
-
-### Subscribe to Event
-
-```bash
-POST /api/event/subscribe
-Content-Type: application/json
-
-{
-  "eventId": "69c3877f7f569"
-}
-```
-
-### Get Current Event
-
-```bash
-GET /api/event/current
-```
-
-### Get Latest Betting Data
-
-```bash
-GET /api/betting-data/latest
-```
-
-### Server-Sent Events (Real-time Stream)
-
-```bash
-GET /api/betting-data/stream
-```
-
-## How It Works
-
-1. Connects to `wss://ws.web-services.live:6001` using Pusher protocol
-2. Subscribes to 8 channels for each event:
-   - `betting-status-{eventId}`
-   - `place-bet-{eventId}` (contains betting data)
-   - `event-status-{eventId}`
-   - `declare-winner-{eventId}`
-   - `send-notification-{eventId}`
-   - `jump-number-{eventId}`
-   - `refresh-all-{eventId}`
-   - `change-team-{eventId}`
-3. Broadcasts received data via Server-Sent Events (SSE)
-
-## Deployment
-
-Since this requires a long-running WebSocket connection, deploy to:
-
-- **Railway**: `railway up`
-- **Render**: Connect GitHub repo and deploy
-- **AWS EC2/Lightsail**: Use PM2 for process management
-- **DigitalOcean Droplet**: Use PM2 for process management
-
-### Using PM2 (Production)
-
-```bash
-npm install -g pm2
-pm2 start index-v2.js --name pusher-listener
-pm2 save
-pm2 startup
-```
-
-## Frontend Integration
-
-Update your frontend's `.env`:
-
-```env
-VITE_BETTING_DATA_API=https://your-deployed-service.com
-```
-
-The React hook `useBettingData()` will automatically connect to the SSE stream.
-
-## Data Structure
-
-The service receives betting data in this format:
+`data/streams.json` is an array of `StreamMeta` objects:
 
 ```json
-{
-  "channel": "place-bet-69c3877f7f569",
-  "event": "App\\Events\\PlaceBet",
-  "data": {
-    "betData": {
-      "betMeron": "154106.00",
-      "betWala": "155483.00",
-      "betDraw": "0.00",
-      "percentMeron": "182.80",
-      "percentWala": "181.19",
-      "myBetMeron": "147243.00",
-      "myBetWala": "147444.00",
-      "myBetDraw": "0.00",
-      "gbbetMeron": "147243.00",
-      "gbbetWala": "147444.00",
-      "actualMeron": "6863.00",
-      "actualWala": "8039.00"
+[
+  {
+    "streamId": "sputnikview-acf",
+    "name": "Sputnikview ACF",
+    "gameId": "game-3",
+    "dataAdapter": "pusher-laravel",
+    "dataConfig": {
+      "socketHost": "wss://ws.web-services.live:6001",
+      "appKey": "shifenkey123",
+      "eventId": "69c408bc63c83"
     },
-    "eventId": "69c3877f7f569"
-  },
-  "timestamp": 1774451080313,
-  "eventId": "69c3877f7f569"
-}
+    "status": "ACTIVE",
+    "sortOrder": 10
+  }
+]
 ```
 
-## Troubleshooting
+Hot-reloaded on every registry tick (default 30s).
 
-- **No data received**: Make sure the eventId is current (changes each round)
-- **Connection issues**: Check firewall settings for WebSocket connections
-- **CORS errors**: Service has CORS enabled, check your frontend URL
+### Site-api registry
+
+Set `REGISTRY_SOURCE=site-api`. Requires `GET /private/internal/streams?gameId=...` to exist on kla-site-api with `X-Service-Token` auth — **not built yet**. Until it lands, stay on `local`.
+
+## Adding a new data provider
+
+1. Implement `DataAdapterFactory` in `src/adapters/<name>.ts`. Translate upstream events into the canonical vocabulary. Never call SSE / disk directly — use the `report` callbacks.
+2. Register the factory in `src/adapters/index.ts`.
+3. Set a stream's `dataAdapter` to your new id in the admin UI.
+
+No core/HTTP/SSE changes needed.
+
+## Run
+
+```
+yarn install
+yarn dev           # tsx watch
+# or
+yarn build && yarn start
+```
+
+Health:
+
+```
+make health
+```
