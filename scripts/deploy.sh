@@ -13,8 +13,13 @@
 #   3. Installs production deps with yarn (auto-installs yarn on first run).
 #   4. Writes/updates the systemd unit and restarts kla-pusher.
 #
-# .env is NOT touched. Manage it on the box separately — it holds secrets
-# (BC24_PASSWORD, SITE_API_SERVICE_TOKEN) that should never be in this repo.
+# .env is NOT touched — manage it on the box separately. It holds
+# non-secret config (PORT, REGISTRY_SOURCE, URLs) and the BC24_* credentials
+# until those move to Secrets Manager too.
+#
+# .env.secrets IS managed: render-env.sh fetches it from AWS Secrets Manager
+# on every kla-pusher start (via systemd ExecStartPre). The instance profile
+# grants read on the `kla-secrets-production` ARN only.
 
 set -euo pipefail
 
@@ -48,6 +53,13 @@ rsync -azL \
   --rsync-path="sudo rsync" \
   package.json yarn.lock "$EC2_HOST:$REMOTE_DIR/"
 
+echo "==> Syncing scripts/render-env.sh"
+rsync -azL \
+  -e "ssh ${SSH_OPTS[*]}" \
+  --rsync-path="sudo rsync" \
+  --chmod=0755 \
+  scripts/render-env.sh "$EC2_HOST:$REMOTE_DIR/render-env.sh"
+
 echo "==> Installing prod deps + restarting $SERVICE"
 ssh "${SSH_OPTS[@]}" "$EC2_HOST" bash -s <<'REMOTE'
 set -euxo pipefail
@@ -61,6 +73,18 @@ cd /opt/kla-pusher
 if ! command -v yarn >/dev/null 2>&1; then
   sudo npm install -g yarn
 fi
+
+# awscli + jq feed render-env.sh which the systemd unit runs as
+# ExecStartPre. New instances get these from user_data, but older boxes
+# created before that change need them installed on first deploy.
+if ! command -v aws >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+  sudo dnf install -y awscli jq
+fi
+
+# render-env.sh needs to be owned by root so the kla-pusher user can't
+# tamper with the script that writes its own env. Executable only.
+sudo chown root:root /opt/kla-pusher/render-env.sh
+sudo chmod 0755 /opt/kla-pusher/render-env.sh
 
 # Clean the yarn cache before installing — the 8GB root volume fills up
 # fast otherwise, especially because esbuild's optionalDependencies pull
@@ -85,7 +109,16 @@ After=network.target
 Type=simple
 User=kla-pusher
 WorkingDirectory=/opt/kla-pusher
+# Hand-managed non-secret config (PORT, REGISTRY_SOURCE, BC24_*, URLs).
 EnvironmentFile=-/opt/kla-pusher/.env
+# Secret bundle written by render-env.sh on every start. Loaded after .env
+# so it wins on overlapping keys (e.g. SITE_API_SERVICE_TOKEN).
+EnvironmentFile=-/opt/kla-pusher/.env.secrets
+# Refresh secrets from AWS Secrets Manager before each start. Runs as root
+# (script chowns the output to kla-pusher:kla-pusher with 0600). If the
+# call fails, the service won't start — that's intentional: we'd rather
+# refuse to boot than silently run with stale credentials.
+ExecStartPre=/opt/kla-pusher/render-env.sh
 ExecStart=/usr/bin/node dist/index.js
 Restart=on-failure
 RestartSec=5

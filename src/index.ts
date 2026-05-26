@@ -12,6 +12,8 @@ import { createRegistry } from './lib/registry.js';
 import { StreamManager, dataRoot } from './lib/stream-manager.js';
 import { createStreamsRouter } from './routes/streams.js';
 import { createHealthRouter } from './routes/health.js';
+import { createNotificationsRouter } from './routes/notifications.js';
+import { NotificationRooms } from './lib/notification-rooms.js';
 
 async function main(): Promise<void> {
   const log = createLogger('kla-pusher');
@@ -20,6 +22,7 @@ async function main(): Promise<void> {
   const siteApi = createSiteApiClient(log.child('site-api'));
   const registry = createRegistry({ log, siteApi });
   const sse = new SseRooms(log.child('sse'));
+  const notificationRooms = new NotificationRooms(log.child('notif'));
   const manager = new StreamManager(
     registry,
     sse,
@@ -36,6 +39,7 @@ async function main(): Promise<void> {
   app.use(express.json());
   app.use(createHealthRouter(manager));
   app.use(createStreamsRouter({ manager, sse, log: log.child('routes') }));
+  app.use(createNotificationsRouter({ rooms: notificationRooms, log: log.child('notif-routes') }));
 
   const server = app.listen(env.port, () => {
     log.info('listening', { port: env.port });
